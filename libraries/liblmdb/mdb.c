@@ -88,7 +88,13 @@ extern int cacheflush(char *addr, int nbytes, int cache);
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef _MSC_VER
+#include <io.h>
+typedef SSIZE_T	ssize_t;
+#else
 #include <unistd.h>
+#endif
 
 #if defined(__sun) || defined(ANDROID)
 /* Most platforms have posix_memalign, older may only have memalign */
@@ -1096,6 +1102,7 @@ struct MDB_env {
 	HANDLE		me_mfd;			/**< just for writing the meta pages */
 #if defined(VL32) && defined(_WIN32)
 	HANDLE		me_fmh;		/**< File Mapping handle */
+    DWORD       me_allocgranularity; /**< Granularity for starting address at which virtual memory can be allocated */
 #endif
 	/** Failed to update the meta page. Probably an I/O error. */
 #define	MDB_FATAL_ERROR	0x80000000U
@@ -2300,10 +2307,22 @@ done:
 	}
 #ifdef VL32
 	{
+        
 		MDB_ID2L rl = mc->mc_txn->mt_rpages;
 		unsigned x = mdb_mid2l_search(rl, mp->mp_pgno);
 		if (x <= rl[0].mid && rl[x].mid == mp->mp_pgno) {
+
+#ifdef _WIN32
+            DWORD alloc_size = mc->mc_txn->mt_env->me_allocgranularity;
+            size_t fmv_l = (char*)mp;
+            size_t off = fmv_l % alloc_size;
+            fmv_l -= off;
+            void* fmv = (char*)fmv_l;
+            UnmapViewOfFile(fmv);
+#else
 			munmap(mp, mc->mc_txn->mt_env->me_psize);
+#endif
+
 			while (x < rl[0].mid) {
 				rl[x] = rl[x+1];
 				x++;
@@ -2838,7 +2857,7 @@ mdb_txn_reset0(MDB_txn *txn, const char *act)
 		unsigned i, n = txn->mt_rpages[0].mid;
 		for (i = 1; i <= n; i++) {
 #ifdef _WIN32
-			UnmapViewOfFile(txn->mt_rpages[i].mptr);
+            UnmapViewOfFile(txn->mt_rpages[i].fmv);
 #else
 			MDB_page *mp = txn->mt_rpages[i].mptr;
 			int size = txn->mt_env->me_psize;
@@ -3726,7 +3745,16 @@ mdb_env_create(MDB_env **env)
 	e->me_wmutex = SEM_FAILED;
 #endif
 	e->me_pid = getpid();
+
+#if defined(VL32) && defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    e->me_os_psize = si.dwPageSize;
+    e->me_allocgranularity = si.dwAllocationGranularity;
+#else
 	GET_PAGESIZE(e->me_os_psize);
+#endif
+
 	VGMEMP_CREATE(e,0,0);
 	*env = e;
 	return MDB_SUCCESS;
@@ -5043,30 +5071,78 @@ mdb_page_get(MDB_txn *txn, pgno_t pgno, MDB_page **ret, int *lvl)
 				p = txn->mt_rpages[x].mptr;
 				goto done;
 			}
+
 			if (txn->mt_rpages[0].mid >= MDB_IDL_UM_MAX) {
+
 				/* unmap some other page */
+                
+                MDB_ID mdb_id = txn->mt_rpages[0].mid;
+
+                int idx = 2;
+
+                for (idx; idx < mdb_id; idx++) {
+                    MDB_page *p = txn->mt_rpages[idx].mptr;
+
+                    if (!IS_BRANCH(p) && !IS_LEAF(p)) {
+                        break;
+                    }
+                }
+
+                if(idx == mdb_id - 1) {
 				mdb_tassert(txn, 0);
 			}
+#ifdef _WIN32
+                HANDLE fmv = txn->mt_rpages[idx].fmv;
+
+                UnmapViewOfFile(fmv);
+#else
+                MDB_page *mp = txn->mt_rpages[branch_index].mptr;
+                int size = txn->mt_env->me_psize;
+                if (IS_OVERFLOW(mp)) size *= mp->mp_pages;
+                munmap(mp, size);
+#endif
+                txn->mt_rpages[0].mid--;
+
+                for (idx; idx < mdb_id; idx++) {
+                    txn->mt_rpages[idx] = txn->mt_rpages[idx + 1];
+                }
+            }
+
 			if (txn->mt_rpages[0].mid < MDB_IDL_UM_SIZE) {
 				MDB_ID2 id2;
 				size_t len = env->me_psize;
 				int np;
 #ifdef _WIN32
 				size_t off = pgno * env->me_psize;
+                size_t read_off = off % env->me_allocgranularity;
+                size_t map_off = off - read_off;
+
+                len += read_off;
+
 				DWORD lo, hi;
-				lo = off & 0xffffffff;
-				hi = off >> 16 >> 16;
-				p = MapViewOfFile(env->me_fmh, FILE_MAP_READ, hi, lo, len);
-				if (p == NULL)
+                lo = map_off & 0xffffffff;
+                hi = map_off >> 16 >> 16;
+                HANDLE fmvh = MapViewOfFile(env->me_fmh, FILE_MAP_READ, hi, lo, len);
+
+                if (fmvh == NULL)
 					return ErrCode();
+
+                p = (MDB_page*)((char*)fmvh + read_off);
+              
 				if (IS_OVERFLOW(p)) {
 					np = p->mp_pages;
-					UnmapViewOfFile(p);
+                    UnmapViewOfFile(fmvh);
+                    len = env->me_psize;
 					len *= np;
-					p = MapViewOfFile(env->me_fmh, FILE_MAP_READ, hi, lo, len);
-					if (p == NULL)
+                    len += read_off;
+                    fmvh = MapViewOfFile(env->me_fmh, FILE_MAP_READ, hi, lo, len);
+                    if (fmvh == NULL)
 						return ErrCode();
+
+                    p = (MDB_page*)((char*)fmvh + read_off);
 				}
+
+                id2.fmv = fmvh;
 #else
 				off_t off = pgno * env->me_psize;
 				p = mmap(NULL, len, PROT_READ, MAP_SHARED, env->me_fd, off);
