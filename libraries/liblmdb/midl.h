@@ -151,6 +151,10 @@ void mdb_midl_sort( MDB_IDL ids );
 typedef struct MDB_ID2 {
 	MDB_ID mid;		/**< The ID */
 	void *mptr;		/**< The pointer */
+
+#if defined(VL32) && defined(_WIN32)
+        void *fmv; /**< The file map view*/
+#endif
 } MDB_ID2;
 
 	/** An ID2L is an ID2 List, a sorted array of ID2s.
